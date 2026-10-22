@@ -1,0 +1,9 @@
+name = "gmail-inbox-collector"
+main = "src/index.js"
+compatibility_date = "2026-10-22"
+workers_dev = true
+
+[vars]
+WORKER_NAME = "gmail-inbox-collector"
+MAX_EMAILS_PER_PAGE = "100"
+MAX_PAGES_PER_RUN = "5"
