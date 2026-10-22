@@ -1,221 +1,215 @@
 // ============================================================
 // GMAIL INBOX COLLECTOR
-// Cloudflare Workers + Supabase + Composio
+// Cloudflare Worker + Supabase + Composio
 //
-// WORKFLOW
-// 1. Receive a POST request from Supabase Cron.
-// 2. Select the oldest-checked connected Gmail integration.
-// 3. Fetch unread emails received within the last 24 hours.
-// 4. Save emails to gmail_processed_messages.
-// 5. Mark successfully saved emails as read.
-// 6. Update last_checked_at.
+// Features:
+// 1. Select oldest unchecked connected Gmail account
+// 2. Find unread emails
+// 3. Save email details to Supabase
+// 4. Avoid duplicate records
+// 5. Mark successfully saved emails as read
+// 6. Update last_checked_at
 //
-// NO AI REPLIES
-// NO GMAIL DRAFTS
-// NO OUTBOUND EMAILS
+// No AI replies or drafts are generated.
 // ============================================================
 
+const WORKER_NAME = "gmail-inbox-collector";
+
+const GMAIL_INTEGRATIONS_TABLE = "user_integrations";
+const EMAILS_TABLE = "gmail_processed_messages";
+
+const COMPOSIO_EXECUTE_URL =
+  "https://backend.composio.dev/api/v3.1/tools/execute/proxy";
+
+const GMAIL_API_BASE =
+  "https://gmail.googleapis.com/gmail/v1";
+
+const DEFAULT_MAX_EMAILS_PER_PAGE = 100;
+const DEFAULT_MAX_PAGES_PER_RUN = 5;
 
 // ============================================================
-// CONFIGURATION
-// ============================================================
-
-const MAX_EMAILS_PER_PAGE = 100;
-const MAX_PAGES_PER_RUN = 5;
-
-
-// ============================================================
-// MAIN WORKER
+// MAIN REQUEST HANDLER
 // ============================================================
 
 export default {
   async fetch(request, env) {
-    // --------------------------------------------------------
-    // 1. Accept POST requests only
-    // --------------------------------------------------------
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Content-Type": "application/json",
+    };
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders,
+      });
+    }
 
     if (request.method !== "POST") {
       return jsonResponse(
         {
           success: false,
-          error: "Only POST requests are supported."
+          worker: WORKER_NAME,
+          error: "Use POST to run the Gmail collector.",
         },
-        405
+        405,
+        corsHeaders
       );
     }
-
-    // --------------------------------------------------------
-    // 2. Validate environment variables
-    // --------------------------------------------------------
-
-    const required = [
-      "SUPABASE_URL",
-      "SUPABASE_SERVICE_ROLE_KEY",
-      "COMPOSIO_API_KEY"
-    ];
-
-    const missing = required.filter((key) => !env[key]);
-
-    if (missing.length > 0) {
-      return jsonResponse(
-        {
-          success: false,
-          error: "Missing Worker environment variables.",
-          missing
-        },
-        500
-      );
-    }
-
-    // --------------------------------------------------------
-    // 3. Select oldest-checked Gmail integration
-    // --------------------------------------------------------
-
-    let integration;
 
     try {
-      integration = await getOldestGmailIntegration(env);
-    } catch (error) {
-      console.error("Integration lookup failed:", error.message);
+      validateEnvironment(env);
 
-      return jsonResponse(
-        {
-          success: false,
-          error: "Could not retrieve Gmail integrations."
-        },
-        500
-      );
-    }
+      const integration = await getOldestGmailIntegration(env);
 
-    if (!integration) {
-      return jsonResponse({
-        success: true,
-        message: "No connected Gmail integrations found.",
-        accounts_checked: 0,
-        emails_saved: 0
-      });
-    }
+      if (!integration) {
+        return jsonResponse(
+          {
+            success: true,
+            worker: WORKER_NAME,
+            message: "No connected Gmail integration needs checking.",
+            stats: emptyStats(),
+          },
+          200,
+          corsHeaders
+        );
+      }
 
-    // --------------------------------------------------------
-    // 4. Initialize processing statistics
-    // --------------------------------------------------------
-
-    const stats = {
-      integration_id: integration.id,
-      emails_found: 0,
-      emails_saved: 0,
-      duplicates: 0,
-      emails_marked_read: 0,
-      email_errors: 0,
-      pages_processed: 0
-    };
-
-    let processingError = null;
-
-    // --------------------------------------------------------
-    // 5. Process selected Gmail account
-    // --------------------------------------------------------
-
-    try {
-      await processGmailAccount(
-        env,
-        integration,
-        stats
-      );
-    } catch (error) {
-      processingError = error.message;
-
-      console.error("Gmail processing failed:", {
-        integration_id: integration.id,
-        error: error.message
-      });
-    } finally {
-      // ------------------------------------------------------
-      // Update timestamp after every processing attempt.
-      // ------------------------------------------------------
+      let stats;
 
       try {
-        await updateLastCheckedAt(env, integration.id);
-      } catch (error) {
-        console.error(
-          "last_checked_at update failed:",
-          error.message
-        );
-
-        processingError = processingError
-          ? `${processingError}; timestamp update failed: ${error.message}`
-          : `Timestamp update failed: ${error.message}`;
+        stats = await processGmailAccount(env, integration);
+      } finally {
+        // Update the selected account's check time even if processing fails.
+        // This prevents one broken account from permanently blocking the queue.
+        try {
+          await updateLastCheckedAt(env, integration.id);
+        } catch (updateError) {
+          console.error(
+            "Could not update last_checked_at:",
+            updateError.message
+          );
+        }
       }
+
+      return jsonResponse(
+        {
+          success: true,
+          worker: WORKER_NAME,
+          message: "Gmail inbox processing finished.",
+          account_id: integration.id,
+          application_id: integration.application_id,
+          stats,
+        },
+        200,
+        corsHeaders
+      );
+    } catch (error) {
+      console.error("Gmail collector error:", error.message);
+
+      return jsonResponse(
+        {
+          success: false,
+          worker: WORKER_NAME,
+          message: "Gmail processing encountered an error.",
+          error: error.message,
+        },
+        500,
+        corsHeaders
+      );
     }
-
-    // --------------------------------------------------------
-    // 6. Return results
-    // --------------------------------------------------------
-
-    return jsonResponse(
-      {
-        success: !processingError,
-        message: processingError
-          ? "Gmail processing encountered an error."
-          : "Gmail processing completed.",
-        account_id: integration.id,
-        application_id: integration.application_id,
-        stats,
-        error: processingError
-      },
-      processingError ? 500 : 200
-    );
-  }
+  },
 };
 
+// ============================================================
+// RESPONSE HELPERS
+// ============================================================
+
+function jsonResponse(body, status = 200, headers = {}) {
+  return new Response(JSON.stringify(body, null, 2), {
+    status,
+    headers,
+  });
+}
+
+function emptyStats() {
+  return {
+    emails_found: 0,
+    emails_saved: 0,
+    duplicates: 0,
+    emails_marked_read: 0,
+    email_errors: 0,
+    pages_processed: 0,
+  };
+}
 
 // ============================================================
-// SUPABASE REST API
+// ENVIRONMENT VALIDATION
 // ============================================================
 
-async function supabaseRequest(
-  env,
-  path,
-  options = {}
-) {
+function validateEnvironment(env) {
+  const required = [
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "COMPOSIO_API_KEY",
+  ];
+
+  const missing = required.filter(
+    (key) => !env[key] || !String(env[key]).trim()
+  );
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing Cloudflare Worker secrets: ${missing.join(", ")}`
+    );
+  }
+}
+
+// ============================================================
+// SUPABASE REST HELPER
+// ============================================================
+
+async function supabaseRequest(env, path, options = {}) {
   const baseUrl = env.SUPABASE_URL.replace(/\/+$/, "");
+
+  const headers = {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+    ...options.headers,
+  };
 
   const response = await fetch(
     `${baseUrl}/rest/v1/${path}`,
     {
       ...options,
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization:
-          `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-        "Content-Type": "application/json",
-        ...(options.headers || {})
-      }
+      headers,
     }
   );
 
-  const text = await response.text();
+  const responseText = await response.text();
 
   if (!response.ok) {
     throw new Error(
-      `Supabase HTTP ${response.status}: ${text}`
+      `Supabase HTTP ${response.status}: ${responseText}`
     );
   }
 
-  if (!text) {
+  if (!responseText) {
     return null;
   }
 
   try {
-    return JSON.parse(text);
+    return JSON.parse(responseText);
   } catch {
-    return text;
+    return responseText;
   }
 }
 
-
 // ============================================================
-// FIND OLDEST-CHECKED GMAIL INTEGRATION
+// SELECT OLDEST CONNECTED GMAIL INTEGRATION
 // ============================================================
 
 async function getOldestGmailIntegration(env) {
@@ -225,389 +219,417 @@ async function getOldestGmailIntegration(env) {
     integration_id: "eq.gmail",
     status: "eq.connected",
     order: "last_checked_at.asc.nullsfirst",
-    limit: "1"
+    limit: "1",
   });
 
   const rows = await supabaseRequest(
     env,
-    `user_integrations?${query.toString()}`
+    `${GMAIL_INTEGRATIONS_TABLE}?${query.toString()}`,
+    {
+      method: "GET",
+    }
   );
 
   if (!Array.isArray(rows) || rows.length === 0) {
     return null;
   }
 
-  return rows[0];
-}
+  const integration = rows[0];
 
-
-// ============================================================
-// PROCESS ONE GMAIL ACCOUNT
-// ============================================================
-
-async function processGmailAccount(
-  env,
-  integration,
-  stats
-) {
-  let pageToken = null;
-
-  for (
-    let page = 0;
-    page < MAX_PAGES_PER_RUN;
-    page++
-  ) {
-    // --------------------------------------------------------
-    // Gmail search:
-    // unread emails received within the last 24 hours
-    // --------------------------------------------------------
-
-    const parameters = [
-      {
-        name: "q",
-        value: "is:unread newer_than:1d",
-        in: "query",
-        type: "string"
-      },
-      {
-        name: "maxResults",
-        value: String(MAX_EMAILS_PER_PAGE),
-        in: "query",
-        type: "string"
-      }
-    ];
-
-    if (pageToken) {
-      parameters.push({
-        name: "pageToken",
-        value: pageToken,
-        in: "query",
-        type: "string"
-      });
-    }
-
-    // --------------------------------------------------------
-    // Fetch message IDs through Composio
-    // --------------------------------------------------------
-
-    const result = await composioProxy(
-      env,
-      integration,
-      {
-        endpoint: "/users/me/messages",
-        method: "GET",
-        parameters
-      }
+  if (!integration.connection_id) {
+    throw new Error(
+      `Gmail integration ${integration.id} has no connection_id.`
     );
-
-    const messages = result?.messages || [];
-
-    stats.pages_processed++;
-    stats.emails_found += messages.length;
-
-    // --------------------------------------------------------
-    // Process each message individually
-    // --------------------------------------------------------
-
-    for (const item of messages) {
-      if (!item.id) {
-        stats.email_errors++;
-        continue;
-      }
-
-      try {
-        const outcome = await processSingleEmail(
-          env,
-          integration,
-          item.id
-        );
-
-        if (outcome === "saved") {
-          stats.emails_saved++;
-        } else if (outcome === "duplicate") {
-          stats.duplicates++;
-        }
-
-        if (outcome !== "failed") {
-          stats.emails_marked_read++;
-        }
-      } catch (error) {
-        stats.email_errors++;
-
-        console.error("Message processing failed:", {
-          gmail_message_id: item.id,
-          integration_id: integration.id,
-          error: error.message
-        });
-
-        // Do not mark an email as read if saving or
-        // verifying its database record failed.
-      }
-    }
-
-    pageToken = result?.nextPageToken || null;
-
-    if (!pageToken) {
-      break;
-    }
   }
+
+  return integration;
 }
 
-
 // ============================================================
-// FETCH AND SAVE ONE EMAIL
+// UPDATE LAST CHECKED TIME
 // ============================================================
 
-async function processSingleEmail(
-  env,
-  integration,
-  messageId
-) {
-  // ----------------------------------------------------------
-  // 1. Retrieve complete message from Gmail
-  // ----------------------------------------------------------
-
-  const message = await composioProxy(
-    env,
-    integration,
-    {
-      endpoint:
-        `/users/me/messages/${encodeURIComponent(messageId)}`,
-      method: "GET",
-      parameters: [
-        {
-          name: "format",
-          value: "full",
-          in: "query",
-          type: "string"
-        }
-      ]
-    }
-  );
-
-  if (!message?.id) {
-    throw new Error("Gmail returned no message ID.");
-  }
-
-  const headers = message.payload?.headers || [];
-
-  const from = getHeader(headers, "from");
-  const to = getHeader(headers, "to");
-  const date = getHeader(headers, "date");
-
-  const sender = parseEmailAddress(from);
-  const recipient = parseEmailAddress(to);
-
-  const receivedAt = message.internalDate
-    ? new Date(
-        Number(message.internalDate)
-      ).toISOString()
-    : parseEmailDate(date);
-
-  const emailContent =
-    extractEmailBody(message.payload) ||
-    message.snippet ||
-    "";
-
-  // ----------------------------------------------------------
-  // 2. Create database record
-  // ----------------------------------------------------------
-
-  const record = {
-    user_id: integration.user_id,
-    application_id: integration.application_id || null,
-    connected_account_id: integration.connection_id,
-    gmail_message_id: message.id,
-
-    sender_email: sender.email || null,
-    sender_name: sender.name || null,
-    recipient_email: recipient.email || null,
-
-    email_content: emailContent,
-    email_received_at: receivedAt,
-
-    email_category: null,
-    should_reply: null,
-
-    ai_draft_reply: null,
-    gmail_draft_id: null,
-
-    status: "pending",
-    error_message: null,
-    processed_at: null
-  };
-
-  // ----------------------------------------------------------
-  // 3. Insert without overwriting existing records
-  //
-  // Requires a unique constraint on:
-  // (connected_account_id, gmail_message_id)
-  // ----------------------------------------------------------
-
+async function updateLastCheckedAt(env, integrationId) {
   const query = new URLSearchParams({
-    on_conflict: "connected_account_id,gmail_message_id"
+    id: `eq.${integrationId}`,
+    integration_id: "eq.gmail",
   });
 
-  const inserted = await supabaseRequest(
+  const now = new Date().toISOString();
+
+  await supabaseRequest(
     env,
-    `gmail_processed_messages?${query.toString()}`,
+    `${GMAIL_INTEGRATIONS_TABLE}?${query.toString()}`,
     {
-      method: "POST",
+      method: "PATCH",
       headers: {
-        Prefer: "resolution=ignore-duplicates,return=representation"
+        Prefer: "return=minimal",
       },
-      body: JSON.stringify(record)
+      body: JSON.stringify({
+        last_checked_at: now,
+        updated_at: now,
+      }),
     }
   );
-
-  // When inserted, Supabase returns the inserted record.
-  // When an existing record is ignored, the array is empty.
-
-  const wasInserted =
-    Array.isArray(inserted) && inserted.length > 0;
-
-  // ----------------------------------------------------------
-  // 4. Mark email as read only after the database operation
-  // succeeds.
-  //
-  // Existing duplicate records are also safe to mark read.
-  // ----------------------------------------------------------
-
-  await composioProxy(
-    env,
-    integration,
-    {
-      endpoint:
-        `/users/me/messages/${encodeURIComponent(message.id)}/modify`,
-      method: "POST",
-      body: {
-        removeLabelIds: ["UNREAD"]
-      }
-    }
-  );
-
-  return wasInserted ? "saved" : "duplicate";
 }
 
-
 // ============================================================
-// COMPOSIO PROXY REQUEST
+// COMPOSIO PROXY EXECUTION
+//
+// IMPORTANT FIX:
+// Composio's raw proxy endpoint expects parameter.type to be
+// "query" or "header", NOT "string".
+//
+// The Gmail API path is passed as an endpoint relative to the
+// Gmail API base URL.
 // ============================================================
 
-async function composioProxy(
+async function composioGmailRequest(
   env,
-  integration,
-  requestOptions
+  connectedAccountId,
+  endpoint,
+  method = "GET",
+  options = {}
 ) {
   const payload = {
-    connected_account_id: integration.connection_id,
-    endpoint: requestOptions.endpoint,
-    method: requestOptions.method
+    connected_account_id: connectedAccountId,
+    endpoint,
+    method: method.toUpperCase(),
   };
 
-  // ----------------------------------------------------------
-  // Add query parameters or headers.
-  //
-  // IMPORTANT FIX:
-  // Each parameter now includes the required "type" property.
-  // ----------------------------------------------------------
-
-  if (requestOptions.parameters) {
-    payload.parameters = requestOptions.parameters.map(
-      (parameter) => ({
-        ...parameter,
-        type: parameter.type || "string"
-      })
-    );
+  // Correct Composio parameter format.
+  // Do not send type: "string".
+  if (
+    Array.isArray(options.parameters) &&
+    options.parameters.length > 0
+  ) {
+    payload.parameters = options.parameters.map((parameter) => ({
+      name: parameter.name,
+      value: String(parameter.value),
+      type: parameter.in === "header" ? "header" : "query",
+    }));
   }
 
-  if (requestOptions.body !== undefined) {
-    payload.body = requestOptions.body;
+  if (options.body !== undefined && options.body !== null) {
+    payload.body = options.body;
   }
 
-  // ----------------------------------------------------------
-  // Send request to Composio
-  // ----------------------------------------------------------
-
-  const response = await fetch(
-    "https://backend.composio.dev/api/v3.1/tools/execute/proxy",
-    {
-      method: "POST",
-      headers: {
-        "x-api-key": env.COMPOSIO_API_KEY,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(payload)
-    }
-  );
+  const response = await fetch(COMPOSIO_EXECUTE_URL, {
+    method: "POST",
+    headers: {
+      "x-api-key": env.COMPOSIO_API_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
 
   const responseText = await response.text();
 
   let result;
 
   try {
-    result = responseText
-      ? JSON.parse(responseText)
-      : {};
+    result = responseText ? JSON.parse(responseText) : {};
   } catch {
     throw new Error(
-      `Composio returned invalid JSON: ${responseText}`
+      `Composio returned non-JSON HTTP ${response.status}: ${responseText}`
     );
   }
-
-  // ----------------------------------------------------------
-  // Check Composio HTTP response
-  // ----------------------------------------------------------
 
   if (!response.ok) {
     throw new Error(
-      `Composio HTTP ${response.status}: ${
-        JSON.stringify(result)
-      }`
+      `Composio HTTP ${response.status}: ${responseText}`
     );
   }
 
-  // ----------------------------------------------------------
-  // Check the actual Gmail API response status.
-  //
-  // Composio can return HTTP 200 even when Gmail returns
-  // a non-2xx status in result.status.
-  // ----------------------------------------------------------
+  // Composio may return an outer successful HTTP response while
+  // the proxied Gmail request itself has failed.
+  const upstreamStatus =
+    result.status ??
+    result.response?.status ??
+    result.data?.status;
 
   if (
-    typeof result.status === "number" &&
-    (result.status < 200 || result.status >= 300)
+    typeof upstreamStatus === "number" &&
+    upstreamStatus >= 400
   ) {
     throw new Error(
-      `Gmail API HTTP ${result.status}: ${
-        JSON.stringify(result.data)
-      }`
+      `Gmail API HTTP ${upstreamStatus}: ${JSON.stringify(result.data ?? result)}`
     );
   }
 
   if (result.error) {
     throw new Error(
-      `Composio error: ${JSON.stringify(result.error)}`
+      `Composio execution error: ${JSON.stringify(result.error)}`
     );
   }
 
-  return result.data ?? result;
+  return result;
 }
 
+// ============================================================
+// EXTRACT PROXIED RESPONSE DATA
+// ============================================================
+
+function extractResponseData(result) {
+  if (!result || typeof result !== "object") {
+    return {};
+  }
+
+  // Common Composio proxy response shape.
+  if (result.data !== undefined) {
+    return result.data;
+  }
+
+  if (result.response?.data !== undefined) {
+    return result.response.data;
+  }
+
+  return result;
+}
 
 // ============================================================
-// READ EMAIL HEADERS
+// GMAIL GET HELPER
 // ============================================================
 
-function getHeader(headers, name) {
-  const header = headers.find(
-    (item) =>
-      item.name?.toLowerCase() === name.toLowerCase()
+async function gmailGet(
+  env,
+  connectionId,
+  endpoint,
+  queryParameters = []
+) {
+  const result = await composioGmailRequest(
+    env,
+    connectionId,
+    endpoint,
+    "GET",
+    {
+      parameters: queryParameters.map((parameter) => ({
+        name: parameter.name,
+        value: parameter.value,
+        in: "query",
+      })),
+    }
   );
 
-  return header?.value || "";
+  return extractResponseData(result);
 }
 
+// ============================================================
+// GMAIL POST HELPER
+// ============================================================
+
+async function gmailPost(
+  env,
+  connectionId,
+  endpoint,
+  body
+) {
+  const result = await composioGmailRequest(
+    env,
+    connectionId,
+    endpoint,
+    "POST",
+    {
+      body,
+    }
+  );
+
+  return extractResponseData(result);
+}
+
+// ============================================================
+// PROCESS ONE GMAIL ACCOUNT
+// ============================================================
+
+async function processGmailAccount(env, integration) {
+  const stats = emptyStats();
+
+  const connectionId = integration.connection_id;
+
+  const maxEmailsPerPage = readPositiveInteger(
+    env.MAX_EMAILS_PER_PAGE,
+    DEFAULT_MAX_EMAILS_PER_PAGE
+  );
+
+  const maxPagesPerRun = readPositiveInteger(
+    env.MAX_PAGES_PER_RUN,
+    DEFAULT_MAX_PAGES_PER_RUN
+  );
+
+  let pageToken = null;
+
+  for (
+    let pageNumber = 0;
+    pageNumber < maxPagesPerRun;
+    pageNumber++
+  ) {
+    const parameters = [
+      {
+        name: "q",
+        value: "is:unread newer_than:1d",
+      },
+      {
+        name: "maxResults",
+        value: String(maxEmailsPerPage),
+      },
+    ];
+
+    if (pageToken) {
+      parameters.push({
+        name: "pageToken",
+        value: pageToken,
+      });
+    }
+
+    // List unread Gmail messages.
+    const listData = await gmailGet(
+      env,
+      connectionId,
+      `${GMAIL_API_BASE}/users/me/messages`,
+      parameters
+    );
+
+    const messages = Array.isArray(listData.messages)
+      ? listData.messages
+      : [];
+
+    stats.pages_processed++;
+
+    if (messages.length === 0) {
+      break;
+    }
+
+    for (const message of messages) {
+      if (!message.id) {
+        stats.email_errors++;
+        continue;
+      }
+
+      stats.emails_found++;
+
+      try {
+        // Fetch complete message.
+        const messageData = await gmailGet(
+          env,
+          connectionId,
+          `${GMAIL_API_BASE}/users/me/messages/${encodeURIComponent(message.id)}`,
+          [
+            {
+              name: "format",
+              value: "full",
+            },
+          ]
+        );
+
+        const email = extractEmailDetails(messageData);
+
+        // Save first. Only mark as read after a successful save
+        // or confirmation that the email already exists.
+        const saveResult = await saveEmailToSupabase(
+          env,
+          integration,
+          message.id,
+          email
+        );
+
+        if (saveResult === "inserted") {
+          stats.emails_saved++;
+        } else {
+          stats.duplicates++;
+        }
+
+        // Mark as read after saving or confirming a duplicate.
+        await gmailPost(
+          env,
+          connectionId,
+          `${GMAIL_API_BASE}/users/me/messages/${encodeURIComponent(message.id)}/modify`,
+          {
+            removeLabelIds: ["UNREAD"],
+          }
+        );
+
+        stats.emails_marked_read++;
+      } catch (emailError) {
+        stats.email_errors++;
+
+        console.error(
+          `Could not process Gmail message ${message.id}:`,
+          emailError.message
+        );
+      }
+    }
+
+    pageToken = listData.nextPageToken || null;
+
+    if (!pageToken) {
+      break;
+    }
+  }
+
+  return stats;
+}
+
+// ============================================================
+// READ POSITIVE INTEGER FROM WORKER ENVIRONMENT
+// ============================================================
+
+function readPositiveInteger(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+
+  return parsed;
+}
+
+// ============================================================
+// EXTRACT EMAIL HEADERS AND BODY
+// ============================================================
+
+function extractEmailDetails(message) {
+  const headers = message.payload?.headers || [];
+
+  const getHeader = (name) => {
+    const found = headers.find(
+      (header) =>
+        String(header.name || "").toLowerCase() ===
+        name.toLowerCase()
+    );
+
+    return found?.value || "";
+  };
+
+  const fromHeader = getHeader("From");
+  const toHeader = getHeader("To");
+  const subject = getHeader("Subject");
+  const dateHeader = getHeader("Date");
+
+  const sender = parseEmailAddress(fromHeader);
+  const recipient = parseEmailAddress(toHeader);
+
+  const body = extractMessageBody(message.payload);
+
+  // email_content stores the subject plus the body because the
+  // database schema uses email_content rather than subject.
+  const emailContent = subject
+    ? `Subject: ${subject}\n\n${body}`
+    : body;
+
+  const receivedAt = message.internalDate
+    ? new Date(Number(message.internalDate)).toISOString()
+    : parseEmailDate(dateHeader);
+
+  return {
+    sender_email: sender.email,
+    sender_name: sender.name,
+    recipient_email: recipient.email,
+    email_content: emailContent,
+    email_received_at: receivedAt,
+    email_category: null,
+    should_reply: null,
+  };
+}
 
 // ============================================================
 // PARSE EMAIL ADDRESS
@@ -616,133 +638,41 @@ function getHeader(headers, name) {
 function parseEmailAddress(value) {
   if (!value) {
     return {
-      name: "",
-      email: ""
+      name: null,
+      email: null,
     };
   }
 
-  const match = value.match(/^(.*?)\s*<([^<>]+)>$/);
+  const textValue = String(value).trim();
+
+  const match = textValue.match(/^(.*?)\s*<([^<>]+)>$/);
 
   if (match) {
     return {
-      name: match[1]
-        .trim()
-        .replace(/^["']|["']$/g, ""),
-      email: match[2].trim()
+      name: cleanDisplayName(match[1]),
+      email: match[2].trim().toLowerCase(),
     };
   }
 
-  const emailMatch = value.match(
+  const emailMatch = textValue.match(
     /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i
   );
 
   return {
-    name: "",
-    email: emailMatch ? emailMatch[0] : value.trim()
+    name: null,
+    email: emailMatch ? emailMatch[0].toLowerCase() : null,
   };
 }
 
-
-// ============================================================
-// DECODE GMAIL BASE64URL BODY
-// ============================================================
-
-function decodeBase64Url(data) {
-  if (!data) {
-    return "";
+function cleanDisplayName(value) {
+  if (!value) {
+    return null;
   }
 
-  const normalized = data
-    .replace(/-/g, "+")
-    .replace(/_/g, "/");
-
-  const padded =
-    normalized +
-    "=".repeat((4 - normalized.length % 4) % 4);
-
-  try {
-    const binary = atob(padded);
-
-    const bytes = Uint8Array.from(
-      binary,
-      (character) => character.charCodeAt(0)
-    );
-
-    return new TextDecoder().decode(bytes);
-  } catch {
-    return "";
-  }
+  return String(value)
+    .trim()
+    .replace(/^["']|["']$/g, "") || null;
 }
-
-
-// ============================================================
-// EXTRACT EMAIL BODY
-// Prefer text/plain; otherwise use text/html.
-// ============================================================
-
-function extractEmailBody(payload) {
-  if (!payload) {
-    return "";
-  }
-
-  const plainParts = [];
-  const htmlParts = [];
-
-  function walk(part) {
-    if (!part) {
-      return;
-    }
-
-    const mimeType =
-      (part.mimeType || "").toLowerCase();
-
-    if (part.body?.data) {
-      const decoded = decodeBase64Url(
-        part.body.data
-      );
-
-      if (mimeType === "text/plain") {
-        plainParts.push(decoded);
-      } else if (mimeType === "text/html") {
-        htmlParts.push(decoded);
-      }
-    }
-
-    if (Array.isArray(part.parts)) {
-      for (const child of part.parts) {
-        walk(child);
-      }
-    }
-  }
-
-  walk(payload);
-
-  if (plainParts.length > 0) {
-    return plainParts.join("\n").trim();
-  }
-
-  if (htmlParts.length > 0) {
-    return htmlParts
-      .join("\n")
-      .replace(/<style[\s\S]*?<\/style>/gi, " ")
-      .replace(/<script[\s\S]*?<\/script>/gi, " ")
-      .replace(/<br\s*\/?>/gi, "\n")
-      .replace(/<\/(div|p|li|tr|h[1-6])>/gi, "\n")
-      .replace(/<[^>]*>/g, " ")
-      .replace(/&nbsp;/gi, " ")
-      .replace(/&amp;/gi, "&")
-      .replace(/&lt;/gi, "<")
-      .replace(/&gt;/gi, ">")
-      .replace(/&quot;/gi, '"')
-      .replace(/&#39;/gi, "'")
-      .replace(/[ \t]+\n/g, "\n")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-  }
-
-  return "";
-}
-
 
 // ============================================================
 // PARSE EMAIL DATE
@@ -750,67 +680,217 @@ function extractEmailBody(payload) {
 
 function parseEmailDate(value) {
   if (!value) {
-    return null;
+    return new Date().toISOString();
   }
 
-  const timestamp = Date.parse(value);
+  const parsed = new Date(value);
 
-  return Number.isNaN(timestamp)
-    ? null
-    : new Date(timestamp).toISOString();
+  if (Number.isNaN(parsed.getTime())) {
+    return new Date().toISOString();
+  }
+
+  return parsed.toISOString();
 }
 
+// ============================================================
+// EXTRACT GMAIL MESSAGE BODY
+// Supports text/plain and text/html MIME parts.
+// ============================================================
+
+function extractMessageBody(payload) {
+  if (!payload) {
+    return "";
+  }
+
+  const parts = [];
+
+  collectBodyParts(payload, parts);
+
+  const plainTextPart = parts.find(
+    (part) => part.mimeType === "text/plain"
+  );
+
+  if (plainTextPart) {
+    return decodeBase64Url(plainTextPart.body?.data || "");
+  }
+
+  const htmlPart = parts.find(
+    (part) => part.mimeType === "text/html"
+  );
+
+  if (htmlPart) {
+    return htmlToText(
+      decodeBase64Url(htmlPart.body?.data || "")
+    );
+  }
+
+  if (payload.body?.data) {
+    const decoded = decodeBase64Url(payload.body.data);
+
+    if (payload.mimeType === "text/html") {
+      return htmlToText(decoded);
+    }
+
+    return decoded;
+  }
+
+  return "";
+}
+
+function collectBodyParts(part, output) {
+  if (!part) {
+    return;
+  }
+
+  if (
+    part.body?.data &&
+    (part.mimeType === "text/plain" ||
+      part.mimeType === "text/html")
+  ) {
+    output.push(part);
+  }
+
+  if (Array.isArray(part.parts)) {
+    for (const child of part.parts) {
+      collectBodyParts(child, output);
+    }
+  }
+}
 
 // ============================================================
-// UPDATE LAST-CHECKED TIMESTAMP
+// DECODE GMAIL BASE64URL BODY
 // ============================================================
 
-async function updateLastCheckedAt(
+function decodeBase64Url(value) {
+  if (!value) {
+    return "";
+  }
+
+  try {
+    const base64 = String(value)
+      .replace(/-/g, "+")
+      .replace(/_/g, "/");
+
+    const padded = base64.padEnd(
+      Math.ceil(base64.length / 4) * 4,
+      "="
+    );
+
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(
+      binary,
+      (character) => character.charCodeAt(0)
+    );
+
+    return new TextDecoder("utf-8", {
+      fatal: false,
+    }).decode(bytes);
+  } catch (error) {
+    console.error("Could not decode Gmail message body:", error.message);
+    return "";
+  }
+}
+
+// ============================================================
+// BASIC HTML TO TEXT CONVERSION
+// ============================================================
+
+function htmlToText(html) {
+  return String(html || "")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|li|tr|h[1-6])\s*>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+// ============================================================
+// SAVE EMAIL TO SUPABASE
+//
+// Required unique constraint:
+// UNIQUE (connected_account_id, gmail_message_id)
+//
+// On duplicate, do not create another record.
+// ============================================================
+
+async function saveEmailToSupabase(
   env,
-  integrationId
+  integration,
+  gmailMessageId,
+  email
 ) {
   const query = new URLSearchParams({
-    id: `eq.${integrationId}`,
-    integration_id: "eq.gmail"
+    on_conflict: "connected_account_id,gmail_message_id",
   });
 
-  const now = new Date().toISOString();
+  const record = {
+    user_id: integration.user_id,
+    application_id: integration.application_id || null,
+    connected_account_id: integration.connection_id,
+    gmail_message_id: gmailMessageId,
+    sender_email: email.sender_email,
+    sender_name: email.sender_name,
+    recipient_email: email.recipient_email,
+    email_content: email.email_content,
+    email_received_at: email.email_received_at,
+    email_category: email.email_category,
+    should_reply: email.should_reply,
 
-  await supabaseRequest(
-    env,
-    `user_integrations?${query.toString()}`,
+    // AI reply generation is not part of this worker.
+    ai_draft_reply: null,
+    gmail_draft_id: null,
+
+    status: "pending",
+    error_message: null,
+    processed_at: null,
+    updated_at: new Date().toISOString(),
+  };
+
+  const response = await fetch(
+    `${env.SUPABASE_URL.replace(/\/+$/, "")}/rest/v1/${EMAILS_TABLE}?${query.toString()}`,
     {
-      method: "PATCH",
+      method: "POST",
       headers: {
-        Prefer: "return=minimal"
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "resolution=ignore-duplicates,return=representation",
       },
-      body: {
-        last_checked_at: now,
-        updated_at: now
-      }
-        ? JSON.stringify({
-            last_checked_at: now,
-            updated_at: now
-          })
-        : undefined
+      body: JSON.stringify(record),
     }
   );
-}
 
+  const responseText = await response.text();
 
-// ============================================================
-// JSON RESPONSE
-// ============================================================
+  if (!response.ok) {
+    throw new Error(
+      `Could not save email to Supabase. HTTP ${response.status}: ${responseText}`
+    );
+  }
 
-function jsonResponse(data, status = 200) {
-  return new Response(
-    JSON.stringify(data, null, 2),
-    {
-      status,
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        "Cache-Control": "no-store"
-      }
+  let returnedRows = [];
+
+  try {
+    returnedRows = responseText ? JSON.parse(responseText) : [];
+  } catch {
+    returnedRows = [];
+  }
+
+  // With return=representation, an inserted record is returned.
+  // An ignored duplicate usually returns an empty array.
+  if (Array.isArray(returnedRows) && returnedRows.length > 0) {
+    return "inserted";
+  }
+
+  return "duplicate";
     }
-  );
-          }
